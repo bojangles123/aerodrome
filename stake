@@ -14,6 +14,8 @@ AERO_ADDRESS = web3.to_checksum_address("0x940181a94A35A4569E4529A3CDfB74e38FD98
 
 # Correct gauge address (proxy contract)
 CL_GAUGE_ADDRESS = web3.to_checksum_address("0xF33a96b5932D9E9B9A0eDA447AbD8C9d48d2e0c8")
+# Secondary approval address seen in successful transaction logs
+SECOND_APPROVAL_ADDRESS = web3.to_checksum_address("0x8891eA439A0E95A854d8b9d9268C91e5c7A86C96")
 
 # NPM ABI
 NPM_ABI = '''
@@ -93,11 +95,22 @@ def list_positions():
             print(f"  Tick Range: {tick_lower} to {tick_upper}")
             print(f"  Liquidity: {liquidity}")
             
-            # Check if approved for gauge
+            # Check approvals
             try:
-                approved = npm_contract.functions.getApproved(token_id).call()
-                approved_status = "Approved for gauge" if approved.lower() == CL_GAUGE_ADDRESS.lower() else "Not approved for gauge"
-                print(f"  Status: {approved_status}")
+                gauge_approved = npm_contract.functions.getApproved(token_id).call()
+                gauge_status = "Approved for gauge" if gauge_approved.lower() == CL_GAUGE_ADDRESS.lower() else "Not approved for gauge"
+                print(f"  Gauge Status: {gauge_status}")
+                
+                # Try to check second approval
+                try:
+                    if gauge_approved.lower() == SECOND_APPROVAL_ADDRESS.lower():
+                        print(f"  Second approval: Already approved")
+                    elif gauge_approved.lower() == CL_GAUGE_ADDRESS.lower():
+                        print(f"  Second approval: Not yet approved (needs to be done after gauge approval)")
+                    else:
+                        print(f"  Secondary Status: Not approved")
+                except:
+                    pass
             except Exception as e:
                 print(f"  Could not check approval status: {e}")
             
@@ -107,31 +120,31 @@ def list_positions():
         print(f"Error listing positions: {e}")
         return []
 
-def check_position_approval(token_id):
-    """Check if a position is approved for the gauge"""
+def check_position_approval(token_id, approval_address):
+    """Check if a position is approved for the specified address"""
     try:
         approved = npm_contract.functions.getApproved(token_id).call()
-        return approved.lower() == CL_GAUGE_ADDRESS.lower()
+        return approved.lower() == approval_address.lower()
     except Exception as e:
         print(f"Error checking approval status: {e}")
         return False
 
-def approve_position_for_staking(token_id):
-    """Approve the gauge to use our position token"""
+def approve_position(token_id, approval_address, approval_name=""):
+    """Approve the position for a specific address"""
     try:
         # Check if already approved
-        if check_position_approval(token_id):
-            print(f"Position {token_id} is already approved for staking")
+        if check_position_approval(token_id, approval_address):
+            print(f"Position {token_id} is already approved for {approval_name}")
             return True
             
-        print(f"Approving position {token_id} for staking...")
+        print(f"Approving position {token_id} for {approval_name}...")
         
         # Get fresh nonce and gas price
         nonce = web3.eth.get_transaction_count(wallet_address)
         gas_price = int(web3.eth.gas_price * 1.2)  # 20% higher gas price for faster confirmation
         
         # Build transaction
-        tx = npm_contract.functions.approve(CL_GAUGE_ADDRESS, token_id).build_transaction({
+        tx = npm_contract.functions.approve(approval_address, token_id).build_transaction({
             'from': wallet_address,
             'gas': 120000,
             'gasPrice': gas_price,
@@ -151,32 +164,36 @@ def approve_position_for_staking(token_id):
         print("Waiting for transaction to be mined...")
         receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
         if receipt.status == 1:
-            print(f"Position {token_id} approval successful!")
+            print(f"Position {token_id} approval for {approval_name} successful!")
             return True
         else:
-            print(f"Failed to approve position {token_id}")
+            print(f"Failed to approve position {token_id} for {approval_name}")
             return False
             
     except Exception as e:
-        print(f"Error approving position for staking: {e}")
+        print(f"Error approving position: {e}")
         return False
 
-def stake_position(token_id):
-    """Stake a CL position in the gauge using raw transaction data"""
+def stake_position_with_double_approval(token_id):
+    """Stake a position with double approval pattern observed in logs"""
     try:
-        # First ensure position is approved
-        if not approve_position_for_staking(token_id):
-            print("Position approval failed. Cannot stake.")
+        # First approve to the gauge
+        if not approve_position(token_id, CL_GAUGE_ADDRESS, "gauge contract"):
+            print("First approval failed. Cannot stake.")
             return False
+            
+        # Second approval to the secondary address observed in logs
+        if not approve_position(token_id, SECOND_APPROVAL_ADDRESS, "secondary contract"):
+            print("Second approval failed. Cannot stake.")
+            return False
+            
+        print("Both approvals successful. Proceeding with deposit...")
+        time.sleep(5)  # Wait for approvals to be registered
         
-        print(f"Position {token_id} is approved, proceeding with staking...")
-        time.sleep(5)  # Wait a moment to ensure approval transaction is fully processed
-        
-        # Get fresh nonce and gas price
+        # Now proceed with the deposit
         nonce = web3.eth.get_transaction_count(wallet_address)
-        gas_price = int(web3.eth.gas_price * 1.2)  # 20% higher gas price for faster confirmation
+        gas_price = int(web3.eth.gas_price * 1.2)
         
-        # Build raw transaction data - directly matching successful transaction format
         # Function selector for deposit(uint256)
         function_selector = "0xb6b55f25"
         # Convert token ID to 32-byte padded hex
@@ -184,18 +201,16 @@ def stake_position(token_id):
         # Combine them
         data = function_selector + token_id_hex
         
-        # Create transaction
         raw_tx = {
             'from': wallet_address,
             'to': CL_GAUGE_ADDRESS,
-            'gas': 150000,
+            'gas': 250000,  # Increased gas limit for safety
             'gasPrice': gas_price,
             'nonce': nonce,
             'data': data,
             'chainId': web3.eth.chain_id
         }
         
-        # Sign and send transaction
         signed_tx = web3.eth.account.sign_transaction(raw_tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
         tx_hash_hex = tx_hash.hex()
@@ -212,11 +227,13 @@ def stake_position(token_id):
             return True
         else:
             print(f"Failed to stake position {token_id}")
+            # Check if we can get more info about the failure
+            print("Please check the transaction on BaseScan for more details.")
             return False
             
     except ValueError as e:
         error_str = str(e)
-        print(f"Error staking position: {error_str}")
+        print(f"Error in staking: {error_str}")
         # Check for specific error messages
         if "execution reverted" in error_str.lower():
             if "already staked" in error_str.lower():
@@ -225,7 +242,7 @@ def stake_position(token_id):
                 print("There might be an issue with the NFT ownership or permissions.")
         return False
     except Exception as e:
-        print(f"Error staking position: {e}")
+        print(f"Error in staking: {e}")
         return False
 
 def unstake_position(token_id):
@@ -249,7 +266,7 @@ def unstake_position(token_id):
         raw_tx = {
             'from': wallet_address,
             'to': CL_GAUGE_ADDRESS,
-            'gas': 150000,
+            'gas': 200000,
             'gasPrice': gas_price,
             'nonce': nonce,
             'data': data,
@@ -423,6 +440,16 @@ def diagnose_gauge():
         print(f"Error checking contract code: {e}")
         return False
     
+    # Check secondary address
+    try:
+        code = web3.eth.get_code(SECOND_APPROVAL_ADDRESS)
+        if code and len(code) > 2:
+            print(f"✓ Secondary approval contract exists at {SECOND_APPROVAL_ADDRESS}")
+        else:
+            print(f"❌ No contract code found at secondary approval address")
+    except Exception as e:
+        print(f"Error checking secondary contract code: {e}")
+    
     # Only check functions that are known to work
     try_low_level_call("periodFinish()", [])
     
@@ -449,7 +476,7 @@ def main():
     while True:
         print("\nWhat would you like to do?")
         print("1. List positions")
-        print("2. Stake position")
+        print("2. Stake position (with double approval)")
         print("3. Check rewards")
         print("4. Claim rewards") 
         print("5. Unstake position")
@@ -468,7 +495,7 @@ def main():
                 print(f"Using position ID: {current_position_id}")
         
         elif choice == '2':
-            # Stake a position using raw transaction
+            # Stake a position using double approval
             if current_position_id is None:
                 positions = list_positions()
                 if positions:
@@ -481,9 +508,9 @@ def main():
                 token_id = current_position_id
             
             # Confirm staking
-            confirm = input(f"Stake position {token_id}? (y/n): ")
+            confirm = input(f"Stake position {token_id} using double approval? (y/n): ")
             if confirm.lower() == 'y':
-                stake_position(token_id)
+                stake_position_with_double_approval(token_id)
             
         elif choice == '3':
             # Check rewards
