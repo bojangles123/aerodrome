@@ -1,0 +1,208 @@
+import time
+from decimal import Decimal, getcontext
+from wallet_setup import web3, wallet_address, private_key, weth_contract, usdc_contract
+
+getcontext().prec = 28
+
+# Contract addresses
+NPM_ADDRESS = web3.to_checksum_address("0xbe85f720f2A28dbda31e8E1752d4bc6940DB0549")
+POOL_ADDRESS = web3.to_checksum_address("0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59")
+WETH_ADDRESS = web3.to_checksum_address("0x4200000000000000000000000000000000000006")
+USDC_ADDRESS = web3.to_checksum_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+
+# ABIs
+POOL_ABI = '''
+[{"inputs":[],"name":"slot0","outputs":[{"internalType":"uint160","name":"sqrtPriceX96","type":"uint160"},{"internalType":"int24","name":"tick","type":"int24"},{"internalType":"uint16","name":"observationIndex","type":"uint16"},{"internalType":"uint16","name":"observationCardinality","type":"uint16"},{"internalType":"uint16","name":"observationCardinalityNext","type":"uint16"},{"internalType":"bool","name":"unlocked","type":"bool"}],"stateMutability":"view","type":"function"},
+{"inputs":[],"name":"fee","outputs":[{"internalType":"uint24","name":"","type":"uint24"}],"stateMutability":"view","type":"function"},
+{"inputs":[],"name":"tickSpacing","outputs":[{"internalType":"int24","name":"","type":"int24"}],"stateMutability":"view","type":"function"}]
+'''
+
+NPM_ABI = '''
+[{"inputs":[{"components":[{"internalType":"address","name":"token0","type":"address"},{"internalType":"address","name":"token1","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickLower","type":"int24"},{"internalType":"int24","name":"tickUpper","type":"int24"},{"internalType":"uint256","name":"amount0Desired","type":"uint256"},{"internalType":"uint256","name":"amount1Desired","type":"uint256"},{"internalType":"uint256","name":"amount0Min","type":"uint256"},{"internalType":"uint256","name":"amount1Min","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct INonfungiblePositionManager.MintParams","name":"params","type":"tuple"}],"name":"mint","outputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint128","name":"liquidity","type":"uint128"},{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"payable","type":"function"}]
+'''
+
+# Full ERC20 ABI with allowance and approve
+ERC20_ABI = '''
+[{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},
+{"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},
+{"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]
+'''
+
+# Initialize contracts
+pool_contract = web3.eth.contract(address=POOL_ADDRESS, abi=POOL_ABI)
+npm_contract = web3.eth.contract(address=NPM_ADDRESS, abi=NPM_ABI)
+weth_token = web3.eth.contract(address=WETH_ADDRESS, abi=ERC20_ABI)
+usdc_token = web3.eth.contract(address=USDC_ADDRESS, abi=ERC20_ABI)
+
+def get_pool_info():
+    """Get important pool parameters"""
+    fee = pool_contract.functions.fee().call()
+    tick_spacing = pool_contract.functions.tickSpacing().call()
+    slot0 = pool_contract.functions.slot0().call()
+    current_tick = slot0[1]
+    
+    print(f"Pool fee: {fee} ({fee/10000:.4f}%)")
+    print(f"Tick spacing: {tick_spacing}")
+    print(f"Current tick: {current_tick}")
+    
+    return fee, tick_spacing, current_tick
+
+def ensure_approval(token, amount):
+    """Ensure token is approved for position manager"""
+    token_symbol = "WETH" if token.address == WETH_ADDRESS else "USDC"
+    
+    allowance = token.functions.allowance(wallet_address, NPM_ADDRESS).call()
+    if allowance >= amount:
+        print(f"{token_symbol} already approved")
+        return True
+    
+    print(f"Approving {token_symbol}...")
+    tx = token.functions.approve(NPM_ADDRESS, 2**256 - 1).build_transaction({
+        'from': wallet_address,
+        'gas': 100000,
+        'gasPrice': web3.eth.gas_price,
+        'nonce': web3.eth.get_transaction_count(wallet_address),
+        'chainId': web3.eth.chain_id
+    })
+    
+    signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+    tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+    receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+    
+    print(f"{token_symbol} approval tx: {receipt.transactionHash.hex()}")
+    return receipt.status == 1
+
+def deposit_to_cl_pool(percentage_of_balance=0.1, tick_range_width=600):
+    """Deposit to Aerodrome CL100 pool with the specified parameters"""
+    # Get pool information
+    fee, tick_spacing, current_tick = get_pool_info()
+    
+    # Calculate tick range (must be multiples of tick_spacing)
+    half_width = (tick_range_width // 2 // tick_spacing) * tick_spacing
+    lower_tick = ((current_tick - half_width) // tick_spacing) * tick_spacing
+    upper_tick = ((current_tick + half_width) // tick_spacing) * tick_spacing
+    
+    print(f"Using tick range: {lower_tick} to {upper_tick}")
+    
+    # Get token balances
+    weth_balance = Decimal(weth_token.functions.balanceOf(wallet_address).call()) / Decimal(1e18)
+    usdc_balance = Decimal(usdc_token.functions.balanceOf(wallet_address).call()) / Decimal(1e6)
+    print(f"Current balances: {weth_balance} WETH, {usdc_balance} USDC")
+    
+    # Calculate amounts to use
+    weth_amount = int(weth_balance * Decimal(percentage_of_balance) * Decimal(1e18))
+    usdc_amount = int(usdc_balance * Decimal(percentage_of_balance) * Decimal(1e6))
+    
+    # Set minimum amounts with 5% slippage
+    weth_min = int(weth_amount * 0.95)
+    usdc_min = int(usdc_amount * 0.95)
+    
+    print(f"Using amounts: {weth_amount/1e18} WETH, {usdc_amount/1e6} USDC")
+    
+    # Ensure approvals
+    if not ensure_approval(weth_token, weth_amount):
+        print("WETH approval failed")
+        return False
+        
+    if not ensure_approval(usdc_token, usdc_amount):
+        print("USDC approval failed")
+        return False
+    
+    # Prepare mint parameters
+    mint_params = {
+        'token0': WETH_ADDRESS,
+        'token1': USDC_ADDRESS,
+        'fee': fee,
+        'tickLower': lower_tick,
+        'tickUpper': upper_tick,
+        'amount0Desired': weth_amount,
+        'amount1Desired': usdc_amount,
+        'amount0Min': weth_min,
+        'amount1Min': usdc_min,
+        'recipient': wallet_address,
+        'deadline': int(time.time() + 3600)
+    }
+    
+    # Print mint parameters
+    print("\nMint parameters:")
+    for key, value in mint_params.items():
+        if key in ['amount0Desired', 'amount1Desired', 'amount0Min', 'amount1Min']:
+            if 'amount0' in key:
+                print(f"{key}: {value / 1e18} WETH")
+            else:
+                print(f"{key}: {value / 1e6} USDC")
+        else:
+            print(f"{key}: {value}")
+    
+    # Skip validation and directly send the transaction
+    nonce = web3.eth.get_transaction_count(wallet_address)
+    gas_price = int(web3.eth.gas_price * 1.5)  # Higher gas price
+    
+    tx = npm_contract.functions.mint(mint_params).build_transaction({
+        'from': wallet_address,
+        'gas': 3000000,
+        'gasPrice': gas_price,
+        'nonce': nonce,
+        'value': int(0.0001 * 1e18),  # Small ETH value
+        'chainId': web3.eth.chain_id
+    })
+    
+    print(f"Gas price: {gas_price / 1e9} Gwei")
+    print("Sending transaction...")
+    
+    signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+    tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+    print(f"Transaction sent: {tx_hash.hex()}")
+    
+    try:
+        receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+        print(f"Transaction status: {'Success' if receipt.status else 'Failed'}")
+        print(f"Gas used: {receipt.gasUsed}")
+        
+        # Check if balances changed
+        new_weth = Decimal(weth_token.functions.balanceOf(wallet_address).call()) / Decimal(1e18)
+        new_usdc = Decimal(usdc_token.functions.balanceOf(wallet_address).call()) / Decimal(1e6)
+        
+        weth_diff = weth_balance - new_weth
+        usdc_diff = usdc_balance - new_usdc
+        
+        print(f"WETH used: {weth_diff}")
+        print(f"USDC used: {usdc_diff}")
+        
+        if weth_diff > 0 or usdc_diff > 0:
+            print("Position created successfully!")
+            return True
+        else:
+            print("Transaction succeeded but no tokens were used. Position may not have been created.")
+            return False
+    except Exception as e:
+        print(f"Error waiting for receipt: {e}")
+        print("Transaction might still be pending. Check the transaction hash on Basescan.")
+        return False
+
+def main():
+    print("Aerodrome CL100 Deposit Tool")
+    print("----------------------------")
+    
+    try:
+        percentage = float(input("Enter percentage of balance to use (1-100): ")) / 100
+        if percentage <= 0 or percentage > 1:
+            print("Invalid percentage. Using 10% instead.")
+            percentage = 0.1
+    except:
+        print("Invalid input. Using 10% of balance.")
+        percentage = 0.1
+    
+    try:
+        tick_range = int(input("Enter tick range width (default 600): "))
+        if tick_range <= 0:
+            print("Invalid range. Using default 600.")
+            tick_range = 600
+    except:
+        print("Invalid input. Using default range of 600.")
+        tick_range = 600
+    
+    deposit_to_cl_pool(percentage, tick_range)
+
+if __name__ == "__main__":
+    main()
