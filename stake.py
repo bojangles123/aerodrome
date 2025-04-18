@@ -14,8 +14,7 @@ AERO_ADDRESS = web3.to_checksum_address("0x940181a94A35A4569E4529A3CDfB74e38FD98
 
 # Correct gauge address (proxy contract)
 CL_GAUGE_ADDRESS = web3.to_checksum_address("0xF33a96b5932D9E9B9A0eDA447AbD8C9d48d2e0c8")
-# Secondary approval address seen in successful transaction logs
-SECOND_APPROVAL_ADDRESS = web3.to_checksum_address("0x8891eA439A0E95A854d8b9d9268C91e5c7A86C96")
+# Removed second approval address
 
 # NPM ABI
 NPM_ABI = '''
@@ -100,17 +99,6 @@ def list_positions():
                 gauge_approved = npm_contract.functions.getApproved(token_id).call()
                 gauge_status = "Approved for gauge" if gauge_approved.lower() == CL_GAUGE_ADDRESS.lower() else "Not approved for gauge"
                 print(f"  Gauge Status: {gauge_status}")
-                
-                # Try to check second approval
-                try:
-                    if gauge_approved.lower() == SECOND_APPROVAL_ADDRESS.lower():
-                        print(f"  Second approval: Already approved")
-                    elif gauge_approved.lower() == CL_GAUGE_ADDRESS.lower():
-                        print(f"  Second approval: Not yet approved (needs to be done after gauge approval)")
-                    else:
-                        print(f"  Secondary Status: Not approved")
-                except:
-                    pass
             except Exception as e:
                 print(f"  Could not check approval status: {e}")
             
@@ -174,44 +162,31 @@ def approve_position(token_id, approval_address, approval_name=""):
         print(f"Error approving position: {e}")
         return False
 
-def stake_position_with_double_approval(token_id):
-    """Stake a position with double approval pattern observed in logs"""
+def stake_position(token_id):
+    """Stake a position with single approval to gauge contract"""
     try:
-        # First approve to the gauge
+        # Approve to the gauge
         if not approve_position(token_id, CL_GAUGE_ADDRESS, "gauge contract"):
-            print("First approval failed. Cannot stake.")
+            print("Approval failed. Cannot stake.")
             return False
             
-        # Second approval to the secondary address observed in logs
-        if not approve_position(token_id, SECOND_APPROVAL_ADDRESS, "secondary contract"):
-            print("Second approval failed. Cannot stake.")
-            return False
-            
-        print("Both approvals successful. Proceeding with deposit...")
-        time.sleep(5)  # Wait for approvals to be registered
+        print("Approval successful. Proceeding with deposit...")
+        time.sleep(5)  # Wait for approval to be registered
         
         # Now proceed with the deposit
         nonce = web3.eth.get_transaction_count(wallet_address)
         gas_price = int(web3.eth.gas_price * 1.2)
         
-        # Function selector for deposit(uint256)
-        function_selector = "0xb6b55f25"
-        # Convert token ID to 32-byte padded hex
-        token_id_hex = hex(token_id)[2:].zfill(64)
-        # Combine them
-        data = function_selector + token_id_hex
-        
-        raw_tx = {
+        # Build transaction using the contract interface
+        tx = cl_gauge_contract.functions.deposit(token_id).build_transaction({
             'from': wallet_address,
-            'to': CL_GAUGE_ADDRESS,
             'gas': 250000,  # Increased gas limit for safety
             'gasPrice': gas_price,
             'nonce': nonce,
-            'data': data,
             'chainId': web3.eth.chain_id
-        }
+        })
         
-        signed_tx = web3.eth.account.sign_transaction(raw_tx, private_key)
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
         tx_hash_hex = tx_hash.hex()
         
@@ -246,7 +221,7 @@ def stake_position_with_double_approval(token_id):
         return False
 
 def unstake_position(token_id):
-    """Unstake a CL position from the gauge using raw transaction data"""
+    """Unstake a CL position from the gauge"""
     try:
         print(f"Preparing to unstake position {token_id}...")
         
@@ -254,27 +229,17 @@ def unstake_position(token_id):
         nonce = web3.eth.get_transaction_count(wallet_address)
         gas_price = int(web3.eth.gas_price * 1.2)  # 20% higher gas price for faster confirmation
         
-        # Build raw transaction data
-        # Function selector for withdraw(uint256)
-        function_selector = "0x2e1a7d4d"
-        # Convert token ID to 32-byte padded hex
-        token_id_hex = hex(token_id)[2:].zfill(64)
-        # Combine them
-        data = function_selector + token_id_hex
-        
-        # Create transaction
-        raw_tx = {
+        # Build transaction using the contract interface
+        tx = cl_gauge_contract.functions.withdraw(token_id).build_transaction({
             'from': wallet_address,
-            'to': CL_GAUGE_ADDRESS,
             'gas': 200000,
             'gasPrice': gas_price,
             'nonce': nonce,
-            'data': data,
             'chainId': web3.eth.chain_id
-        }
+        })
         
         # Sign and send transaction
-        signed_tx = web3.eth.account.sign_transaction(raw_tx, private_key)
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
         tx_hash_hex = tx_hash.hex()
         
@@ -365,7 +330,7 @@ def try_low_level_call(function_sig, params=None):
         return False
 
 def claim_rewards():
-    """Claim accrued AERO rewards using raw transaction"""
+    """Claim accrued AERO rewards"""
     try:
         # Get initial AERO balance for comparison
         initial_aero = check_aero_balance()
@@ -374,23 +339,17 @@ def claim_rewards():
         nonce = web3.eth.get_transaction_count(wallet_address)
         gas_price = int(web3.eth.gas_price * 1.2)  # 20% higher gas price for faster confirmation
         
-        # Build raw transaction data
-        # Function selector for getReward()
-        function_selector = "0x3d18b912"
-        
-        # Create transaction
-        raw_tx = {
+        # Build transaction using the contract interface
+        tx = cl_gauge_contract.functions.getReward().build_transaction({
             'from': wallet_address,
-            'to': CL_GAUGE_ADDRESS,
             'gas': 150000,
             'gasPrice': gas_price,
             'nonce': nonce,
-            'data': function_selector,
             'chainId': web3.eth.chain_id
-        }
+        })
         
         # Sign and send transaction
-        signed_tx = web3.eth.account.sign_transaction(raw_tx, private_key)
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
         tx_hash_hex = tx_hash.hex()
         
@@ -440,16 +399,6 @@ def diagnose_gauge():
         print(f"Error checking contract code: {e}")
         return False
     
-    # Check secondary address
-    try:
-        code = web3.eth.get_code(SECOND_APPROVAL_ADDRESS)
-        if code and len(code) > 2:
-            print(f"✓ Secondary approval contract exists at {SECOND_APPROVAL_ADDRESS}")
-        else:
-            print(f"❌ No contract code found at secondary approval address")
-    except Exception as e:
-        print(f"Error checking secondary contract code: {e}")
-    
     # Only check functions that are known to work
     try_low_level_call("periodFinish()", [])
     
@@ -476,7 +425,7 @@ def main():
     while True:
         print("\nWhat would you like to do?")
         print("1. List positions")
-        print("2. Stake position (with double approval)")
+        print("2. Stake position")
         print("3. Check rewards")
         print("4. Claim rewards") 
         print("5. Unstake position")
@@ -495,7 +444,7 @@ def main():
                 print(f"Using position ID: {current_position_id}")
         
         elif choice == '2':
-            # Stake a position using double approval
+            # Stake a position with single approval
             if current_position_id is None:
                 positions = list_positions()
                 if positions:
@@ -508,9 +457,9 @@ def main():
                 token_id = current_position_id
             
             # Confirm staking
-            confirm = input(f"Stake position {token_id} using double approval? (y/n): ")
+            confirm = input(f"Stake position {token_id}? (y/n): ")
             if confirm.lower() == 'y':
-                stake_position_with_double_approval(token_id)
+                stake_position(token_id)
             
         elif choice == '3':
             # Check rewards
