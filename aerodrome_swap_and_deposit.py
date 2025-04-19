@@ -1,13 +1,17 @@
+# aerodrome_auto_deposit.py
 import time
 import math
 from decimal import Decimal, getcontext
 from wallet_setup import web3, wallet_address, private_key, weth_contract, usdc_contract
 
+# Import rebalance function from aerodrome_swap
+from aerodrome_swap import rebalance_wallet, get_wallet_balances
+
 getcontext().prec = 28
 
 # Contract addresses
 NPM_ADDRESS = web3.to_checksum_address("0x827922686190790b37229fd06084350e74485b72")
-POOL_ADDRESS = web3.to_checksum_address("0xb2cc224c1c9feE385f8ad6a55b4d94e92359dc59")
+POOL_ADDRESS = web3.to_checksum_address("0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59")
 HELPER_ADDRESS = web3.to_checksum_address("0x9c62ab10577fB3C20A22E231b7703Ed6D456CC7a")
 WETH_ADDRESS = web3.to_checksum_address("0x4200000000000000000000000000000000000006")
 USDC_ADDRESS = web3.to_checksum_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
@@ -62,50 +66,54 @@ def get_pool_info():
 
     return current_tick, tick_spacing, sqrt_price_x96, eth_price_in_usdc
 
-def calculate_two_percent_tick_range(current_tick, tick_spacing, eth_price_in_usdc):
-    """Calculate a +/-2% price range around the current price"""
+def calculate_two_percent_tick_range(current_tick, tick_spacing):
+    """Calculate a symmetrical +/-2% price range around the current price"""
     # Calculate how many ticks correspond to a 2% price change
     ticks_for_2_percent = int(math.log(1.02) / math.log(1.0001))
 
-    # For a +2% ETH price, we need a lower tick value (inverse relationship)
-    # For a -2% ETH price, we need a higher tick value
-    higher_eth_price_tick = current_tick - ticks_for_2_percent  # +2% ETH price
-    lower_eth_price_tick = current_tick + ticks_for_2_percent   # -2% ETH price
+    # Calculate the raw target ticks
+    lower_tick_target = current_tick - ticks_for_2_percent
+    upper_tick_target = current_tick + ticks_for_2_percent
 
-    # In Uniswap V3, the "lower tick" must always be < the "upper tick"
-    lower_tick = min(higher_eth_price_tick, lower_eth_price_tick)
-    upper_tick = max(higher_eth_price_tick, lower_eth_price_tick)
+    # Calculate the midpoint (should be very close to current_tick)
+    midpoint = (lower_tick_target + upper_tick_target) / 2
 
-    # Round to the nearest tick spacing
-    lower_tick = math.floor(lower_tick / tick_spacing) * tick_spacing
-    upper_tick = math.floor(upper_tick / tick_spacing) * tick_spacing
+    # Round the midpoint to the nearest tick spacing
+    midpoint_rounded = round(midpoint / tick_spacing) * tick_spacing
 
-    # Ensure they are at least one tick spacing apart
-    if upper_tick <= lower_tick:
-        upper_tick = lower_tick + tick_spacing
+    # Calculate equal distance from the rounded midpoint
+    half_range = ((upper_tick_target - lower_tick_target) / 2)
+    # Round to the nearest multiple of tick spacing, but never less than 1 spacing
+    half_range_ticks = max(1, round(half_range / tick_spacing)) * tick_spacing
 
-    # Calculate actual prices at these ticks
-    # We'll use the same formula as in get_pool_info to maintain consistency
+    # Calculate new lower and upper ticks
+    lower_tick = midpoint_rounded - half_range_ticks
+    upper_tick = midpoint_rounded + half_range_ticks
+
+    # Verify the calculated ticks by determining the price percentage change
     def calculate_price_from_tick(tick):
-        # Formula: price = 1.0001^tick * 10^12
         sqrt_price_x96 = helper_contract.functions.getSqrtRatioAtTick(tick).call()
         price = (Decimal(sqrt_price_x96) / Decimal(2**96)) ** 2 * Decimal(1e12)
-        return float(price)
+        return price
 
-    lower_eth_price = calculate_price_from_tick(lower_tick)
-    upper_eth_price = calculate_price_from_tick(upper_tick)
+    # Get the current price
+    current_price = calculate_price_from_tick(current_tick)
 
-    # Calculate percent differences
-    lower_pct_diff = ((lower_eth_price / eth_price_in_usdc) - 1) * 100
-    upper_pct_diff = ((upper_eth_price / eth_price_in_usdc) - 1) * 100
+    # Get the price at the lower and upper ticks
+    lower_price = calculate_price_from_tick(lower_tick)
+    upper_price = calculate_price_from_tick(upper_tick)
+
+    # Calculate the percentage difference
+    lower_pct_diff = ((lower_price / current_price) - 1) * 100
+    upper_pct_diff = ((upper_price / current_price) - 1) * 100
 
     print(f"\n+/-2% Price Range Details:")
     print(f"Target range: {ticks_for_2_percent} ticks from current (~2%)")
-    print(f"Current ETH price: ${eth_price_in_usdc:.2f}")
+    print(f"Current ETH price: ${float(current_price):.2f}")
     print(f"Lower tick: {lower_tick}")
     print(f"Upper tick: {upper_tick}")
-    print(f"Lower ETH price: ${lower_eth_price:.2f} ({lower_pct_diff:.2f}%)")
-    print(f"Upper ETH price: ${upper_eth_price:.2f} ({upper_pct_diff:.2f}%)")
+    print(f"Lower ETH price: ${float(lower_price):.2f} ({float(lower_pct_diff):.2f}%)")
+    print(f"Upper ETH price: ${float(upper_price):.2f} ({float(upper_pct_diff):.2f}%)")
 
     return lower_tick, upper_tick
 
@@ -236,35 +244,37 @@ def ensure_approval(token, amount):
     print(f"{token_symbol} approval tx: {receipt.transactionHash.hex()}")
     return receipt.status == 1
 
-def create_position_ui_flow():
-    """Create a position following the UI flow with a fixed +/-2% range"""
+def create_position_ui_flow_with_rebalance():
+    """Create a position following the UI flow with a fixed +/-2% range,
+    after rebalancing the wallet first"""
+    # Step 0: Rebalance wallet first
+    print("\n🚀 Rebalancing wallet before creating position...")
+    rebalance_wallet()
+
+    # Give some time for blockchain state to update
+    print("Waiting for rebalancing to finalize...")
+    time.sleep(5)
+
     # Step 1: Get pool info
     current_tick, tick_spacing, sqrt_price_x96, eth_price = get_pool_info()
 
     # Step 2: Calculate the +/-2% tick range
-    lower_tick, upper_tick = calculate_two_percent_tick_range(current_tick, tick_spacing, eth_price)
+    lower_tick, upper_tick = calculate_two_percent_tick_range(current_tick, tick_spacing)
 
     print(f"\nUsing fixed +/-2% tick range: {lower_tick} to {upper_tick}")
 
     # Step 3: Get token balances
-    weth_balance = Decimal(weth_token.functions.balanceOf(wallet_address).call()) / Decimal(1e18)
-    usdc_balance = Decimal(usdc_token.functions.balanceOf(wallet_address).call()) / Decimal(1e6)
+    _, weth_balance, usdc_balance, _ = get_wallet_balances()
     print(f"Current balances: {weth_balance} WETH, {usdc_balance} USDC")
 
-    # Step 4: Get WETH amount from user
-    while True:
-        try:
-            weth_amount_input = float(input(f"\nEnter amount of WETH to deposit (max {weth_balance}): "))
-            if 0 < weth_amount_input <= float(weth_balance):
-                break
-            print(f"Amount must be greater than 0 and less than your balance ({weth_balance})")
-        except ValueError:
-            print("Please enter a valid number.")
+    # Calculate 99% of WETH to use for deposit
+    balance_factor = Decimal('0.995')  # Use 99.5% of balances
+    weth_amount = weth_balance * balance_factor
+    print(f"\nUsing {weth_amount:.6f} WETH ({balance_factor * 100}% of balance) for deposit")
 
-    weth_amount = Decimal(str(weth_amount_input))
     weth_amount_wei = int(weth_amount * Decimal(1e18))
 
-    # Step 5: Calculate optimal token amounts
+    # Step 4: Calculate optimal token amounts to match Aerodrome UI
     calculated_weth_wei, calculated_usdc_wei = calculate_optimal_amounts(
         weth_amount, lower_tick, upper_tick, current_tick, sqrt_price_x96
     )
@@ -273,50 +283,29 @@ def create_position_ui_flow():
     calculated_weth = Decimal(calculated_weth_wei) / Decimal(1e18)
     calculated_usdc = Decimal(calculated_usdc_wei) / Decimal(1e6)
 
-    # If we get a different WETH amount than requested, adjust it to match the input
-    if abs(calculated_weth - weth_amount) > Decimal('0.000001') and calculated_weth > 0:
-        scaling_factor = weth_amount / calculated_weth
-        calculated_usdc = calculated_usdc * scaling_factor
-        calculated_usdc_wei = int(calculated_usdc * Decimal(1e6))
-        calculated_weth = weth_amount
-        calculated_weth_wei = weth_amount_wei
-
-    print(f"\nOptimal token amounts:")
+    print(f"\nOptimal token amounts (matching Aerodrome UI):")
     print(f"WETH: {calculated_weth:.6f}")
     print(f"USDC: {calculated_usdc:.2f}")
 
     # Check if user has enough USDC
     if calculated_usdc > usdc_balance:
         print(f"Warning: You don't have enough USDC (need {calculated_usdc:.2f}, have {usdc_balance})")
-        use_all = input("Use all available USDC instead? (y/n): ").lower() == 'y'
-        if use_all:
-            # Scale down both tokens proportionally to match available USDC
-            scaling_factor = usdc_balance / calculated_usdc
-            calculated_weth = calculated_weth * scaling_factor
-            calculated_weth_wei = int(calculated_weth * Decimal(1e18))
-            calculated_usdc = usdc_balance
-            calculated_usdc_wei = int(calculated_usdc * Decimal(1e6))
-            print(f"Adjusted amounts:")
-            print(f"WETH: {calculated_weth:.6f}")
-            print(f"USDC: {calculated_usdc:.2f}")
-        else:
-            print("Operation cancelled")
-            return False
+        print("Scaling down amounts to match available USDC...")
+        # Scale down both tokens proportionally to match available USDC
+        scaling_factor = (usdc_balance * Decimal('0.99')) / calculated_usdc
+        calculated_weth = calculated_weth * scaling_factor
+        calculated_weth_wei = int(calculated_weth * Decimal(1e18))
+        calculated_usdc = usdc_balance * Decimal('0.99')
+        calculated_usdc_wei = int(calculated_usdc * Decimal(1e6))
+        print(f"Adjusted amounts:")
+        print(f"WETH: {calculated_weth:.6f}")
+        print(f"USDC: {calculated_usdc:.2f}")
 
     # Set minimum amounts with 0.5% slippage
     weth_min = int(Decimal(calculated_weth_wei) * Decimal('0.995'))
     usdc_min = int(Decimal(calculated_usdc_wei) * Decimal('0.995'))
 
-    # Confirm with user
-    print("\nReady to create position with:")
-    print(f"Tick range: {lower_tick} to {upper_tick} (+/-2% price range)")
-    print(f"WETH amount: {calculated_weth:.6f}")
-    print(f"USDC amount: {calculated_usdc:.2f}")
-    confirm = input("Proceed? (y/n): ").lower() == 'y'
-
-    if not confirm:
-        print("Operation cancelled")
-        return False
+    print("\nProceeding with position creation automatically...")
 
     # Ensure approvals
     if calculated_weth_wei > 0 and not ensure_approval(weth_token, calculated_weth_wei):
@@ -344,10 +333,11 @@ def create_position_ui_flow():
     }
 
     # Build and send transaction
-    nonce = web3.eth.get_transaction_count(wallet_address)
-    gas_price = int(web3.eth.gas_price * 1.5)  # Higher gas price for faster confirmation
-
     try:
+        # Using exact same nonce approach as working code
+        nonce = web3.eth.get_transaction_count(wallet_address)
+        gas_price = int(web3.eth.gas_price * 1.5)  # Higher gas price for faster confirmation
+
         tx = npm_contract.functions.mint(mint_params).build_transaction({
             'from': wallet_address,
             'gas': 3000000,
@@ -368,8 +358,7 @@ def create_position_ui_flow():
         print(f"Transaction status: {'Success' if receipt.status else 'Failed'}")
 
         # Check if balances changed
-        new_weth = Decimal(weth_token.functions.balanceOf(wallet_address).call()) / Decimal(1e18)
-        new_usdc = Decimal(usdc_token.functions.balanceOf(wallet_address).call()) / Decimal(1e6)
+        _, new_weth, new_usdc, _ = get_wallet_balances()
 
         weth_diff = weth_balance - new_weth
         usdc_diff = usdc_balance - new_usdc
@@ -388,9 +377,9 @@ def create_position_ui_flow():
         return False
 
 def main():
-    print("Aerodrome CL Position Creator - Fixed 2% Range Version")
+    print("Aerodrome CL Position Creator - With Auto-Rebalance")
     print("-----------------------------------------------------")
-    create_position_ui_flow()
+    create_position_ui_flow_with_rebalance()
 
 if __name__ == "__main__":
     main()
