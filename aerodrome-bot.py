@@ -1,3 +1,4 @@
+(bot-env) ubuntu@ip-172-31-10-9:~$ cat aerodrome_bot.py
 # aerodrome_bot.py
 import time
 import math
@@ -112,7 +113,7 @@ def get_pool_info():
             logger.info(f"Current ETH price: ${eth_price_in_usdc:.2f}")
 
             return current_tick, tick_spacing, sqrt_price_x96, eth_price_in_usdc
-        
+
         except Exception as e:
             if attempt < RETRY_ATTEMPTS - 1:
                 logger.warning(f"Error getting pool info (attempt {attempt+1}/{RETRY_ATTEMPTS}): {e}")
@@ -153,13 +154,13 @@ def ensure_approval(token, amount, spender):
 def create_position():
     """Create a CL position with +/-2% range using the existing deposit module"""
     global active_position_id
-    
+
     try:
         logger.info(f"Creating new position using {DEPOSIT_FILE}.py")
-        
+
         # Dynamically import the module
         deposit_module = __import__(DEPOSIT_FILE)
-        
+
         # Try different function names based on what's available in the module
         if hasattr(deposit_module, 'create_position_ui_flow_with_rebalance'):
             logger.info("Using create_position_ui_flow_with_rebalance function")
@@ -170,10 +171,10 @@ def create_position():
         else:
             logger.error(f"No suitable position creation function found in {DEPOSIT_FILE}.py")
             return None
-        
+
         # Call the create position function
         result = create_function()
-        
+
         if result:
             # Find the latest position created
             num_positions = npm_contract.functions.balanceOf(wallet_address).call()
@@ -181,10 +182,10 @@ def create_position():
                 latest_token_id = npm_contract.functions.tokenOfOwnerByIndex(wallet_address, num_positions - 1).call()
                 logger.info(f"New position created with ID: {latest_token_id}")
                 active_position_id = latest_token_id
-                
+
                 # Stake position immediately
                 stake_position(latest_token_id)
-                
+
                 return latest_token_id
             else:
                 logger.error("Position creation reported success but no position found")
@@ -192,7 +193,7 @@ def create_position():
         else:
             logger.error("Failed to create position")
             return None
-            
+
     except Exception as e:
         logger.error(f"Error in create_position: {e}")
         return None
@@ -201,13 +202,13 @@ def stake_position(token_id):
     """Stake position in the gauge"""
     try:
         logger.info(f"Staking position ID: {token_id}")
-        
+
         # Ensure the NFT is approved for the gauge
         approval_check = npm_contract.functions.getApproved(token_id).call()
-        
+
         if approval_check != CL_GAUGE_ADDRESS:
             logger.info("Approving NFT for gauge...")
-            
+
             # Approve NFT
             approve_tx = npm_contract.functions.approve(CL_GAUGE_ADDRESS, token_id).build_transaction({
                 'from': wallet_address,
@@ -215,19 +216,19 @@ def stake_position(token_id):
                 'gasPrice': int(web3.eth.gas_price * GAS_PRICE_MULTIPLIER),
                 'chainId': web3.eth.chain_id
             })
-            
+
             signed_tx = web3.eth.account.sign_transaction(approve_tx, private_key)
             tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            
+
             logger.info(f"Approval transaction sent: {tx_hash.hex()}")
             receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-            
+
             if receipt.status != 1:
                 logger.error("NFT approval failed")
                 return False
-                
+
             logger.info("NFT approved for gauge")
-        
+
         # Stake the position using deposit function
         stake_tx = gauge_contract.functions.deposit(token_id).build_transaction({
             'from': wallet_address,
@@ -236,20 +237,20 @@ def stake_position(token_id):
             'gas': GAS_LIMIT_MEDIUM,
             'chainId': web3.eth.chain_id
         })
-        
+
         signed_tx = web3.eth.account.sign_transaction(stake_tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        
+
         logger.info(f"Stake transaction sent: {tx_hash.hex()}")
         receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-        
+
         if receipt.status == 1:
             logger.info(f"Position {token_id} successfully staked")
             return True
         else:
             logger.error(f"Failed to stake position {token_id}")
             return False
-            
+
     except Exception as e:
         logger.error(f"Error staking position: {e}")
         return False
@@ -261,19 +262,19 @@ def check_position_in_range(token_id):
         position = npm_contract.functions.positions(token_id).call()
         tick_lower = position[5]
         tick_upper = position[6]
-        
+
         # Get current tick
         current_tick, _, _, _ = get_pool_info()
-        
+
         # Check if position is in range
         in_range = tick_lower <= current_tick <= tick_upper
-        
+
         logger.info(f"Position {token_id} range: {tick_lower} to {tick_upper}")
         logger.info(f"Current tick: {current_tick}")
         logger.info(f"Position is {'in' if in_range else 'out of'} range")
-        
+
         return in_range
-        
+
     except Exception as e:
         logger.error(f"Error checking position range: {e}")
         return None
@@ -281,9 +282,9 @@ def check_position_in_range(token_id):
 def daily_claim_and_sell():
     """Claim rewards daily and sell AERO for USDC"""
     global active_position_id
-    
+
     logger.info("Performing daily claim and sell")
-    
+
     if active_position_id is None:
         # Find active position if we don't know it
         positions = list_positions()
@@ -292,10 +293,10 @@ def daily_claim_and_sell():
         else:
             logger.warning("No active position found for daily claim")
             return
-    
+
     # Import here to avoid circular imports
     from aerodrome_rewards_claim import claim_rewards
-    
+
     # Claim rewards
     if claim_rewards(active_position_id):
         logger.info("Rewards claimed successfully")
@@ -309,17 +310,17 @@ def daily_claim_and_sell():
 def monitor_and_rebalance():
     """Monitor position and rebalance if needed"""
     global active_position_id, last_position_check
-    
+
     current_time = time.time()
-    
+
     # Limit check frequency
     if last_position_check and current_time - last_position_check < 300:  # 5 minutes
         return
-        
+
     last_position_check = current_time
-    
+
     logger.info("Monitoring position...")
-    
+
     if active_position_id is None:
         # Find active position if we don't know it
         positions = list_positions()
@@ -329,27 +330,27 @@ def monitor_and_rebalance():
             logger.info("No active position found, creating one...")
             active_position_id = create_position()
             return
-    
+
     # Check if position is in range
     in_range = check_position_in_range(active_position_id)
-    
+
     if in_range is False:  # Only rebalance if explicitly out of range
         logger.info("Position out of range, rebalancing...")
-        
+
         # Import modules only when needed
         from aerodrome_rewards_claim import claim_rewards
         from aerodrome_unstake import unstake_position
         import aerodrome_withdraw
-        
+
         # 1. Claim rewards
         if not claim_rewards(active_position_id):
             logger.warning("Failed to claim rewards, continuing with rebalance anyway")
-        
+
         # 2. Unstake position
         if not unstake_position(active_position_id):
             logger.error("Failed to unstake position, aborting rebalance")
             return
-            
+
         # 3. Withdraw position
         try:
             logger.info("Withdrawing position using aerodrome_withdraw.py")
@@ -357,10 +358,10 @@ def monitor_and_rebalance():
         except Exception as e:
             logger.error(f"Error in withdrawal step: {e}")
             return
-        
+
         # 4. Create new position
         active_position_id = create_position()
-        
+
         if active_position_id:
             logger.info(f"Rebalance complete, new position ID: {active_position_id}")
         else:
@@ -371,32 +372,32 @@ def list_positions():
     try:
         # Get number of positions owned by the user
         num_positions = npm_contract.functions.balanceOf(wallet_address).call()
-        
+
         if num_positions == 0:
             logger.info("No positions found")
             return []
-            
+
         positions = []
         logger.info(f"Found {num_positions} position(s)")
-        
+
         for i in range(num_positions):
             # Get token ID for each position
             token_id = npm_contract.functions.tokenOfOwnerByIndex(wallet_address, i).call()
-            
+
             # Get position details
             position = npm_contract.functions.positions(token_id).call()
-            
+
             # Extract relevant details
             token0 = position[2]
             token1 = position[3]
             tick_lower = position[5]
             tick_upper = position[6]
             liquidity = position[7]
-            
+
             # Determine token names
             token0_name = "WETH" if token0.lower() == WETH_ADDRESS.lower() else "USDC"
             token1_name = "USDC" if token1.lower() == USDC_ADDRESS.lower() else "WETH"
-            
+
             # Store position details
             position_info = {
                 'token_id': token_id,
@@ -409,14 +410,14 @@ def list_positions():
                 'liquidity': liquidity
             }
             positions.append(position_info)
-            
+
             logger.info(f"Position #{i+1} (Token ID: {token_id}):")
             logger.info(f"  Tokens: {token0_name}/{token1_name}")
             logger.info(f"  Tick Range: {tick_lower} to {tick_upper}")
             logger.info(f"  Liquidity: {liquidity}")
-            
+
         return positions
-        
+
     except Exception as e:
         logger.error(f"Error listing positions: {e}")
         return []
@@ -424,21 +425,21 @@ def list_positions():
 def initialize_bot():
     """Initialize the bot and find or create a position"""
     global active_position_id
-    
+
     logger.info("Initializing Aerodrome Liquidity Management Bot")
-    
+
     # Get token balances
     weth_balance, usdc_balance, aero_balance = get_token_balances()
     logger.info(f"Initial balances: {weth_balance} WETH, {usdc_balance} USDC, {aero_balance} AERO")
-    
+
     # Check for existing positions
     positions = list_positions()
-    
+
     if positions:
         # Use the first position found
         active_position_id = positions[0]['token_id']
         logger.info(f"Using existing position: {active_position_id}")
-        
+
         # Check if position is staked - if not, stake it
         try:
             # We could verify if position is already staked here, but for simplicity
@@ -450,29 +451,29 @@ def initialize_bot():
         # Create a new position
         logger.info("No positions found, creating a new one")
         active_position_id = create_position()
-        
+
     logger.info("Bot initialized successfully")
 
 def run_bot():
     """Main bot loop"""
     # Initialize bot
     initialize_bot()
-    
+
     # Schedule daily claim and sell at midnight
     schedule.every().day.at("00:00").do(daily_claim_and_sell)
-    
+
     # Main loop
     while True:
         try:
             # Run scheduled tasks
             schedule.run_pending()
-            
+
             # Monitor and rebalance if needed
             monitor_and_rebalance()
-            
+
             # Sleep to avoid excessive API calls
             time.sleep(60)  # Check every minute
-            
+
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
             time.sleep(300)  # Longer sleep on error
